@@ -210,9 +210,9 @@ def is_my_preset_target(
       ``get_open_close_state``, which returns only 0, 100 or ``None``. Arm 1
       books ``routed_target == position == _current`` and arm 2's own gate is
       ``_current == routed_target``, so either way the booked number is one of
-      those endpoints. Arm 1's endpoint-tolerance sub-arm is the single case
-      where ``routed_target`` may diverge from ``_current``, and it books
-      nothing at all.
+      those endpoints. Arm 1's endpoint-tolerance and executed-decision
+      sub-arms (#507, #1350) are the only cases where ``routed_target`` may
+      diverge from ``_current``, and neither books anything at all.
     * Arm 3 fires only when ``_current`` is ``None`` or a synthetic open/close
       mapping, and its gate IS ``last_target == plan.routed_target``
       (``_same_position_via_target_fallback``). By the time it books, the
@@ -274,8 +274,9 @@ def build_special_positions(options: dict) -> list[int]:
     TO or FROM these key values even when the position change is smaller
     than ``min_change``.  They do NOT bypass the same-position short-circuit in
     ``apply_position`` — if the cover is already at or within
-    endpoint-tolerance of the target,
-    no command is sent regardless of whether the target is special.
+    endpoint-tolerance of the target, or was already sent this target and
+    rests within tolerance of it (issue #1350), no command is sent regardless
+    of whether the target is special.
 
     When ``CONF_ENFORCE_DELTA_AT_ENDPOINTS`` is enabled (issue #679), the 0
     and 100 endpoints are omitted so the normal delta gate runs for those
