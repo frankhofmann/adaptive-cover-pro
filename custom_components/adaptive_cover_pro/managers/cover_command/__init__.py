@@ -419,6 +419,7 @@ class CoverCommandService:
         position: int | None,
         *,
         dispatch_token: Any = None,
+        keep_decision: bool = False,
     ) -> None:
         """Set the commanded target position. ``None`` clears the target.
 
@@ -429,10 +430,32 @@ class CoverCommandService:
         one without the other. Callers with no dispatch behind the write (a
         rehydrated target, an externally-observed My move, a clear) leave it at
         ``None``: no provenance is the honest answer there.
+
+        A write that changes the value also forgets ``decided`` (issue #1350):
+        that decision produced the old number, not this one. Restating the
+        same value — a reconciliation resend — keeps it. The one writer that
+        moves ``target`` without a new decision behind it, the dual-axis
+        carriage rebase, goes through :meth:`rebase_target` with
+        ``keep_decision=True``.
         """
         s = self.state(entity_id)
+        if s.target != position and not keep_decision:
+            s.decided = None
         s.target = position
         s.dispatch_token = dispatch_token
+
+    def rebase_target(self, entity_id: str, position: int) -> None:
+        """Move ``target`` to where ACP's own tilt send left the carriage.
+
+        The dual-axis sequencer's post-tilt rebase (its
+        ``set_commanded_position``): a tilt-only send back-drives the carriage,
+        and the observed position replaces ``target`` so reconciliation sees no
+        gap to chase (#33/#187). The decision behind the target is unchanged —
+        it merely came to rest somewhere else — so ``decided`` is kept;
+        forgetting it would let the next cycle re-send that decision and
+        back-drive the slats again (issue #1350).
+        """
+        self.set_target(entity_id, position, keep_decision=True)
 
     def restore_target(self, entity_id: str, target: int | None) -> bool:
         """Rehydrate a persisted command target after an ACP reload (issue #1022).
@@ -1562,6 +1585,40 @@ class CoverCommandService:
             )
         return last_target == plan.routed_target
 
+    def _decision_already_executed(
+        self, entity_id: str, position: int, current: int
+    ) -> bool:
+        """Whether ``position`` is a decision this cover has already executed (#1350).
+
+        True when ``position`` is the decision ``apply_position`` last put on
+        the wire for this entity (``PerEntityState.decided``), its target is
+        still booked, and the cover rests within ``_position_tolerance`` of
+        that target — the same "arrived" predicate (:meth:`_at_target`)
+        ``check_target_reached``, reconciliation and ``is_target_unreached``
+        apply. Re-sending would ask the motor for a number it was already
+        asked for and cannot land on more precisely, and the delta gate cannot
+        be relied on to hold it: special targets, moves away from a special,
+        and forced dispatches all bypass it.
+
+        A NEW decision never matches, so a small tracking move within
+        tolerance of the current reading still reaches the delta gate (#567).
+        A cover that has left the tolerance band since no longer matches and
+        is re-commanded.
+
+        Args:
+            entity_id: Cover entity ID.
+            position: This cycle's pre-routing calculated target.
+            current: The genuine current reading (the caller's
+                ``_current_is_genuine`` guard has already established it).
+
+        """
+        s = self._get(entity_id)
+        return (
+            s.decided == position
+            and s.target is not None
+            and self._at_target(current, s.target)
+        )
+
     async def _service_secondary_axis(
         self,
         entity_id: str,
@@ -1760,7 +1817,7 @@ class CoverCommandService:
         # at the target is a true no-op that causes audible relay clicks on many
         # motors (issue #290), so we suppress it here.
         #
-        # For non-endpoint targets (normal solar tracking moves) this gate uses
+        # For NEW non-endpoint targets (normal solar tracking moves) this gate uses
         # EXACT equality only — it is NOT a hysteresis band.  Movement hysteresis
         # (how big a move must be before we re-command) is owned solely by
         # _check_position_delta below, governed by the user's CONF_DELTA_POSITION.
@@ -1774,8 +1831,17 @@ class CoverCommandService:
         # every update cycle, causing audible relay clicks (issue #507).  To
         # prevent this we apply _position_tolerance here, but ONLY when the target
         # is 0 or 100 — the literal mechanical stops, not mid-range setpoints.
-        # Mid-range specials (default_height, sunset_pos, my_position) keep exact
-        # equality so a within-tolerance drift from those still triggers a move.
+        #
+        # Every target, endpoint or not, also gets a tolerance sub-arm keyed on
+        # the DECISION rather than on the number (issue #1350): this cycle's
+        # target is the one apply_position already put on the wire
+        # (PerEntityState.decided) and the cover rests within _position_tolerance
+        # of its booked target (_decision_already_executed). Mid-range specials
+        # (default_height, sunset_pos, my_position, an always-enforced limit),
+        # moves away from a special, and forced dispatches all bypass the delta
+        # gate, so without it a cover that cannot land on the exact number is
+        # re-commanded every cycle. A new decision never matches, so #567 is
+        # untouched, and a cover that has left the band since is re-commanded.
         #
         # sun_just_appeared is the one exception: the sun transitioning in/out of
         # validity is a sentinel that we must re-confirm the cover position even
@@ -1966,6 +2032,9 @@ class CoverCommandService:
                         or (
                             position in (0, 100) and self._at_target(_current, position)
                         )
+                        or self._decision_already_executed(
+                            entity_id, position, _current
+                        )
                     )
                 )
                 or (
@@ -2010,8 +2079,14 @@ class CoverCommandService:
             # answer — every other arm books normally, which covers the case
             # issue #1158 actually reports.
             #
-            # Verified against `route_service_call` (routing.py) that this is
-            # the ONLY sub-arm where the mismatch can occur: arm 1's
+            # Arm 1's executed-decision sub-arm (#1350) is the other place
+            # `_current` may sit off `_plan.routed_target`, and it needs no
+            # booking at all: its own gate requires the decision's target to
+            # be booked already, so this guard leaves that target exactly as
+            # the dispatch (or the carriage rebase) wrote it.
+            #
+            # Verified against `route_service_call` (routing.py) that these two
+            # are the ONLY sub-arms where the mismatch can occur: arm 1's
             # direct-equality sub-arm (`_current == position`) always yields
             # `_plan.routed_target == _current` by construction (both the
             # endpoint-routing and plain set_position branches echo `state`
@@ -2063,7 +2138,7 @@ class CoverCommandService:
             self._record_safety_verdict(entity_id, context, _plan.routed_target)
 
             # Secondary axis LAST: on a venetian this may rebase the target
-            # via set_commanded_position (== set_target) after a tilt-only
+            # via set_commanded_position (== rebase_target) after a tilt-only
             # send back-drives the carriage (#33/#187), and that rebase must
             # have the last word over the booking above, not be clobbered by
             # it (reopens #33 otherwise).
@@ -2365,6 +2440,12 @@ class CoverCommandService:
                     inverse_state=_inverse,
                     current_position=_current,
                 )
+
+            # The decision this dispatch executes (issue #1350), booked beside
+            # the target ``_prepare_service_call`` just wrote, so later cycles'
+            # same-position gate can tell "already asked for this" from a new
+            # decision. Ahead of the dry-run gate, like the target itself.
+            self.state(entity_id).decided = position
 
             # ----- dry-run gate -----
             if self._dry_run:
@@ -2675,7 +2756,8 @@ class CoverCommandService:
 
         Single source of truth for the "close enough" predicate used by
         check_target_reached, run_reconciliation_pass, get_diagnostics, and
-        the same-position gate in apply_position (endpoint-only tolerance).
+        the same-position gate in apply_position (the endpoint-tolerance and
+        executed-decision sub-arms).
         """
         return abs(actual - target) <= self._position_tolerance
 
