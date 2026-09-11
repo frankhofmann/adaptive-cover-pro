@@ -834,7 +834,7 @@ class AdaptiveDataUpdateCoordinator(DataUpdateCoordinator[AdaptiveCoverData]):
             # issue #1115). Additive: every other policy ignores it.
             entities=self.entities,
             get_current_position=self._cmd_svc.get_current_position,
-            set_commanded_position=self._cmd_svc.set_target,
+            set_commanded_position=self._cmd_svc.rebase_target,
             position_tolerance=POSITION_TOLERANCE_PERCENT,
             is_dry_run=lambda: self._cmd_svc.dry_run,
             get_state=lambda eid: getattr(self.hass.states.get(eid), "state", None),
