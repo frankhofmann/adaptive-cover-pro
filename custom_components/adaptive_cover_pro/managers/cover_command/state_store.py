@@ -237,6 +237,20 @@ class PerEntityState:
     # percent, which ``stop_cover`` puts on the wire without a position for any
     # frame to describe.
     dispatch_token: Any = None
+    # The DECISION behind ``target`` (issue #1350): the pre-routing position
+    # ``apply_position`` last put on the wire for this entity. ``target`` is
+    # where the cover is expected to rest, and the two part ways when the
+    # dual-axis carriage rebase absorbs a tilt back-drive into ``target`` — the
+    # decision is unchanged, only its resting point moved. One reader:
+    # ``apply_position``'s same-position gate, which treats an unchanged
+    # decision on a cover resting within ``_position_tolerance`` of ``target``
+    # as already executed, so a cover that cannot land on the exact number is
+    # not re-commanded every cycle. One writer, ``apply_position``'s dispatch
+    # path; a reconciliation resend restates ``target`` and leaves it alone.
+    # ``set_target`` forgets it whenever ``target`` changes value (the rebase,
+    # via ``rebase_target``, excepted), and ``discard_target`` drops it with the
+    # whole row on both manual-override edges.
+    decided: int | None = None
     sent_at: dt.datetime | None = None
     # The raw axis value read at the moment ``target`` was dispatched (issue
     # #1139) — the SAME ``prior_position`` value both ``sent_at`` writers
@@ -318,7 +332,8 @@ class PerEntityState:
     #   decision, so it is a pure revoke, never a grant.
     # * ``cover_types/venetian/sequencer.py``'s carriage rebase — pushes the
     #   observed carriage position back through ``set_commanded_position``
-    #   (== ``set_target``) after a tilt-only send back-drives it.
+    #   (== ``rebase_target``, which writes through ``set_target``) after a
+    #   tilt-only send back-drives it.
     #
     # Today's blast radius is small, but the inheritance is real, and it is why
     # ``_record_safety_verdict`` declines to GRANT on a row with nothing
